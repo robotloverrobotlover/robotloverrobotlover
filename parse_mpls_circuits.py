@@ -87,16 +87,19 @@ KNOWN_COLORS = {
     "FF5B9BD5": "blue",
     "FF8DB4E2": "light blue",
     "FFB4C6E7": "light blue",
+    "FF8EAADB": "light blue",
     "FF00AA00": "green",
     "FF008000": "green",
     "FF006400": "dark green",
     "FF70AD47": "green",
-    "FF548235": "olive",
+    "FF548235": "dark green",
     "FF375623": "dark green",
     "FF7030A0": "purple",
     "FF000000": "black",
     "FF0000FF": "blue",
     "FF00FF00": "green",
+    "FFC6EFCE": "light green",
+    "FFE2EFDA": "light green",
 }
 
 
@@ -134,9 +137,28 @@ def _normalize_hex(raw: str) -> str | None:
     return None
 
 
+def _classify_hex6(hex6: str) -> str:
+    """Guess a color name from RGB when not in KNOWN_COLORS."""
+    r, g, b = _hex_to_rgb(hex6)
+    if b > max(r, g) + 20 and b > 120:
+        return "light blue" if b > 150 or (b > 100 and g > 100) else "blue"
+    if g > max(r, b) + 20 and g > 80:
+        if g < 110 or (r < 80 and b < 80):
+            return "dark green"
+        if g > 170:
+            return "light green"
+        return "green"
+    return f"#{hex6[-6:]}"
+
+
 def _name_from_hex(hex8: str) -> str:
     key = hex8 if len(hex8) == 8 else "FF" + hex8
-    return KNOWN_COLORS.get(key, KNOWN_COLORS.get(key[-6:], f"#{key[-6:]}"))
+    if key in KNOWN_COLORS:
+        return KNOWN_COLORS[key]
+    hex6 = key[-6:]
+    if hex6 in KNOWN_COLORS:
+        return KNOWN_COLORS[hex6]
+    return _classify_hex6(hex6)
     
 
 def resolve_color(color) -> str | None:
@@ -366,34 +388,66 @@ def infer_site_columns_from_data(
 # Port extraction
 # ---------------------------------------------------------------------------
 
+def _cell_raw_value(
+    values_sheet: Worksheet, styles_sheet: Worksheet, row: int, col: int
+) -> str | None:
+    for sheet in (values_sheet, styles_sheet):
+        val = sheet.cell(row, col).value
+        if val is not None:
+            text = str(val).strip()
+            if text and not text.startswith("="):
+                return text
+    return None
+
+
 def port_at_row(
     values_sheet: Worksheet,
     styles_sheet: Worksheet,
     merges: MergeIndex,
     row: int,
     col: int,
+    block_start: int = 0,
 ) -> tuple[str | None, str | None]:
-    style_cell = styles_sheet.cell(row, col)
-    bounds = merges.bounds(row, col)
+    """Return port text and fill color for one site cell.
 
+    Handles: direct values, vertically merged multiline cells, and multiline
+    text stored in an earlier row while later rows carry only the fill color.
+    """
+    style_cell = styles_sheet.cell(row, col)
+    color = cell_fill_color(style_cell)
+
+    bounds = merges.bounds(row, col)
     if bounds and bounds[1] > bounds[0]:
-        top_row, _, top_col, _ = bounds
-        top_val_cell = values_sheet.cell(top_row, top_col)
-        top_style_cell = styles_sheet.cell(top_row, top_col)
-        raw = top_val_cell.value
-        if raw is None:
-            return None, None
-        lines = [ln.strip() for ln in str(raw).splitlines()]
-        idx = row - top_row
-        if idx < len(lines) and lines[idx]:
-            return lines[idx], cell_fill_color(top_style_cell)
+        top_row = bounds[0]
+        raw = _cell_raw_value(values_sheet, styles_sheet, top_row, col)
+        if raw:
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            idx = row - top_row
+            if idx < len(lines):
+                if color is None:
+                    color = cell_fill_color(styles_sheet.cell(top_row, col))
+                return lines[idx], color
         return None, None
 
-    val_cell = values_sheet.cell(row, col)
-    if val_cell.value is not None:
-        text = str(val_cell.value).strip()
-        if text:
-            return text, cell_fill_color(style_cell)
+    # Multiline text in an earlier row of the same column (common MPLS layout).
+    if block_start:
+        for src_row in range(block_start, row + 1):
+            raw = _cell_raw_value(values_sheet, styles_sheet, src_row, col)
+            if raw and "\n" in raw:
+                lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+                idx = row - src_row
+                if idx < len(lines):
+                    return lines[idx], color
+
+    raw = _cell_raw_value(values_sheet, styles_sheet, row, col)
+    if raw:
+        if "\n" in raw:
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            idx = row - block_start if block_start else 0
+            if idx < len(lines):
+                return lines[idx], color
+            return lines[0], color
+        return raw, color
 
     return None, None
 
@@ -454,9 +508,12 @@ def row_has_site_ports(
     merges: MergeIndex,
     row: int,
     sites: list[tuple[int, str]],
+    block_start: int = 0,
 ) -> bool:
     for col, _ in sites:
-        port, _ = port_at_row(values_sheet, styles_sheet, merges, row, col)
+        port, _ = port_at_row(
+            values_sheet, styles_sheet, merges, row, col, block_start
+        )
         if port:
             return True
     return False
@@ -483,7 +540,9 @@ def block_end(
             circ = str(values_sheet.cell(row, circuit_col).value or "").strip() if circuit_col else ""
             if circ:
                 break
-            if row_has_site_ports(values_sheet, styles_sheet, merges, row, sites):
+            if row_has_site_ports(
+                values_sheet, styles_sheet, merges, row, sites, start
+            ):
                 end = row
             else:
                 break
@@ -515,34 +574,22 @@ def connections_in_block(
     sites: list[tuple[int, str]],
 ) -> list[Connection]:
     result: list[Connection] = []
-    pending: SitePort | None = None
 
     for row in range(start, end + 1):
         ports: list[SitePort] = []
         for col, site_name in sites:
-            port, color = port_at_row(values_sheet, styles_sheet, merges, row, col)
+            port, color = port_at_row(
+                values_sheet, styles_sheet, merges, row, col, start
+            )
             if port:
                 ports.append(SitePort(site_name, port, color))
 
         if len(ports) >= 2:
-            if pending:
-                result.append(Connection([pending]))
-                pending = None
             for i in range(0, len(ports) - 1, 2):
                 if i + 1 < len(ports):
                     result.append(Connection([ports[i], ports[i + 1]]))
         elif len(ports) == 1:
-            if pending:
-                result.append(Connection([pending, ports[0]]))
-                pending = None
-            else:
-                pending = ports[0]
-        elif pending:
-            result.append(Connection([pending]))
-            pending = None
-
-    if pending:
-        result.append(Connection([pending]))
+            result.append(Connection([ports[0]]))
 
     return result
 
