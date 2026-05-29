@@ -168,8 +168,34 @@ def format_output(circuits):
         lines.append("")
     return "\n".join(lines)
 
-circuits = parse_excel("/home/claude/Altemp2_template.xlsx")
+import sys
+import os
+
+if len(sys.argv) < 2:
+    print("Usage: python parse_circuits.py <input.xlsx> [output.txt]")
+    print("Example: python parse_circuits.py AItemp2.xlsx circuits_output.txt")
+    sys.exit(1)
+
+input_file = sys.argv[1]
+
+if not os.path.exists(input_file):
+    print(f"Error: File not found: {input_file}")
+    sys.exit(1)
+
+# Default output filename: same as input but .txt
+if len(sys.argv) >= 3:
+    output_file = sys.argv[2]
+else:
+    output_file = os.path.splitext(input_file)[0] + "_output.txt"
+
+print(f"Reading: {input_file}")
+circuits = parse_excel(input_file)
+print(f"Found {len(circuits)} circuit(s).")
+
 text = format_output(circuits)
 print(text)
-with open("/home/claude/circuits_output.txt", "w") as f:
+
+with open(output_file, "w", encoding="utf-8") as f:
     f.write(text)
+
+print(f"\nOutput saved to: {output_file}")
