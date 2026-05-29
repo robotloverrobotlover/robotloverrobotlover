@@ -1,23 +1,32 @@
 import openpyxl
 
 def get_cell_color(cell):
-    fill = cell.fill
-    if fill and fill.fill_type not in (None, "none"):
-        try:
-            rgb = fill.fgColor.rgb
-        except Exception:
+    try:
+        fill = cell.fill
+        if not fill or fill.fill_type in (None, "none"):
             return None
-        if rgb and rgb not in ("00000000", "FF000000", "FFFFFFFF"):
-            color_map = {
-                "FF2E7D32": "green",  "FF00695C": "teal",   "FF1565C0": "blue",
-                "FF00AA00": "green",  "FF007070": "teal",   "FF005500": "dark green",
-                "FF008000": "green",  "FF006400": "dark green",
-                "FF4E7C2F": "mid green", "FF1F5C1F": "dark green",
-                "FF6B8E23": "olive",  "FF90C060": "light green",
-            }
-            r = rgb.upper()
-            return color_map.get(r, f"#{r[-6:]}")
-    return None
+        fg = fill.fgColor
+        # fgColor.rgb may be a string or an RGB object depending on openpyxl version
+        rgb = fg.rgb
+        if not isinstance(rgb, str):
+            # RGB object: convert to hex string
+            try:
+                rgb = "{:02X}{:02X}{:02X}{:02X}".format(rgb.alpha, rgb.red, rgb.green, rgb.blue)
+            except Exception:
+                rgb = str(rgb)
+        rgb = rgb.upper()
+        if rgb in ("00000000", "FF000000", "FFFFFFFF", "00FFFFFF"):
+            return None
+        color_map = {
+            "FF2E7D32": "green",      "FF00695C": "teal",      "FF1565C0": "blue",
+            "FF00AA00": "green",      "FF007070": "teal",      "FF005500": "dark green",
+            "FF008000": "green",      "FF006400": "dark green",
+            "FF4E7C2F": "mid green",  "FF1F5C1F": "dark green",
+            "FF6B8E23": "olive",      "FF90C060": "light green",
+        }
+        return color_map.get(rgb, f"#{rgb[-6:]}")
+    except Exception:
+        return None
 
 def parse_excel(filepath):
     wb = openpyxl.load_workbook(filepath)
