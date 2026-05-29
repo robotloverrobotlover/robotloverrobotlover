@@ -23,9 +23,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import openpyxl
+from openpyxl.styles.colors import COLOR_INDEX
 from openpyxl.worksheet.worksheet import Worksheet
 
 PORT_RE = re.compile(r"\d+/\d+/\d+")
+
+# Default Excel theme accent palette (Office 2007+)
+THEME_PALETTE = [
+    "FFFFFF", "000000", "E7E6E6", "44546A", "4472C4", "ED7D31",
+    "A5A5A5", "FFC000", "5B9BD5", "70AD47", "0563C1", "954F72",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -77,28 +84,89 @@ KNOWN_COLORS = {
     "FF00695C": "teal",
     "FF1565C0": "blue",
     "FF4472C4": "blue",
+    "FF5B9BD5": "blue",
     "FF8DB4E2": "light blue",
     "FFB4C6E7": "light blue",
     "FF00AA00": "green",
     "FF008000": "green",
     "FF006400": "dark green",
+    "FF70AD47": "green",
     "FF548235": "olive",
     "FF375623": "dark green",
     "FF7030A0": "purple",
+    "FF000000": "black",
+    "FF0000FF": "blue",
+    "FF00FF00": "green",
 }
 
 
-def rgb_to_hex(rgb) -> str | None:
-    if rgb is None:
+def _hex_to_rgb(hex6: str) -> tuple[int, int, int]:
+    h = hex6[-6:]
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _rgb_to_hex6(r: int, g: int, b: int) -> str:
+    return f"{r:02X}{g:02X}{b:02X}"
+
+
+def _apply_tint(hex6: str, tint: float) -> str:
+    r, g, b = _hex_to_rgb(hex6)
+    if tint < 0:
+        factor = 1 + tint
+        r, g, b = int(r * factor), int(g * factor), int(b * factor)
+    else:
+        r = int(r + (255 - r) * tint)
+        g = int(g + (255 - g) * tint)
+        b = int(b + (255 - b) * tint)
+    return _rgb_to_hex6(r, g, b)
+
+
+def _normalize_hex(raw: str) -> str | None:
+    if not raw or not isinstance(raw, str):
         return None
-    if isinstance(rgb, str):
-        return rgb.upper()
-    try:
-        return "{:02X}{:02X}{:02X}{:02X}".format(
-            rgb.alpha, rgb.red, rgb.green, rgb.blue
-        ).upper()
-    except Exception:
-        return str(rgb).upper()
+    raw = raw.strip().upper()
+    if raw in ("00000000", "FF000000", "FFFFFFFF", "00FFFFFF", "AUTO", "NONE"):
+        return None
+    if len(raw) == 8:
+        return raw
+    if len(raw) == 6:
+        return "FF" + raw
+    return None
+
+
+def _name_from_hex(hex8: str) -> str:
+    key = hex8 if len(hex8) == 8 else "FF" + hex8
+    return KNOWN_COLORS.get(key, KNOWN_COLORS.get(key[-6:], f"#{key[-6:]}"))
+    
+
+def resolve_color(color) -> str | None:
+    """Resolve an openpyxl Color object to a human-readable color name."""
+    if color is None:
+        return None
+    ctype = getattr(color, "type", None)
+
+    if ctype == "rgb":
+        try:
+            raw = color.rgb
+        except Exception:
+            raw = None
+        hex8 = _normalize_hex(raw) if raw else None
+        return _name_from_hex(hex8) if hex8 else None
+
+    if ctype == "indexed":
+        idx = color.indexed
+        if idx is not None and 0 <= idx < len(COLOR_INDEX):
+            hex8 = _normalize_hex(COLOR_INDEX[idx])
+            return _name_from_hex(hex8) if hex8 else None
+
+    if ctype == "theme":
+        theme = color.theme
+        tint = color.tint or 0.0
+        if theme is not None and 0 <= theme < len(THEME_PALETTE):
+            hex6 = _apply_tint(THEME_PALETTE[theme], tint)
+            return _name_from_hex("FF" + hex6)
+
+    return None
 
 
 def cell_fill_color(cell) -> str | None:
@@ -106,12 +174,14 @@ def cell_fill_color(cell) -> str | None:
         fill = cell.fill
         if not fill or fill.fill_type in (None, "none"):
             return None
-        rgb = rgb_to_hex(fill.fgColor.rgb)
-        if not rgb or rgb in ("00000000", "FF000000", "FFFFFFFF", "00FFFFFF"):
-            return None
-        return KNOWN_COLORS.get(rgb, f"#{rgb[-6:]}")
+        for attr in ("fgColor", "start_color", "bgColor"):
+            c = getattr(fill, attr, None)
+            name = resolve_color(c)
+            if name:
+                return name
     except Exception:
-        return None
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -297,30 +367,33 @@ def infer_site_columns_from_data(
 # ---------------------------------------------------------------------------
 
 def port_at_row(
-    sheet: Worksheet,
+    values_sheet: Worksheet,
+    styles_sheet: Worksheet,
     merges: MergeIndex,
     row: int,
     col: int,
 ) -> tuple[str | None, str | None]:
-    cell = sheet.cell(row, col)
+    style_cell = styles_sheet.cell(row, col)
     bounds = merges.bounds(row, col)
 
     if bounds and bounds[1] > bounds[0]:
         top_row, _, top_col, _ = bounds
-        top_cell = sheet.cell(top_row, top_col)
-        raw = top_cell.value
+        top_val_cell = values_sheet.cell(top_row, top_col)
+        top_style_cell = styles_sheet.cell(top_row, top_col)
+        raw = top_val_cell.value
         if raw is None:
             return None, None
         lines = [ln.strip() for ln in str(raw).splitlines()]
         idx = row - top_row
         if idx < len(lines) and lines[idx]:
-            return lines[idx], cell_fill_color(top_cell)
+            return lines[idx], cell_fill_color(top_style_cell)
         return None, None
 
-    if cell.value is not None:
-        text = str(cell.value).strip()
+    val_cell = values_sheet.cell(row, col)
+    if val_cell.value is not None:
+        text = str(val_cell.value).strip()
         if text:
-            return text, cell_fill_color(cell)
+            return text, cell_fill_color(style_cell)
 
     return None, None
 
@@ -330,28 +403,68 @@ def port_at_row(
 # ---------------------------------------------------------------------------
 
 def read_field(
-    sheet: Worksheet, merges: MergeIndex, row: int, col: int | None
+    sheet: Worksheet,
+    merges: MergeIndex,
+    row: int,
+    col: int | None,
+    formula_sheet: Worksheet | None = None,
+    circuit_col: int | None = None,
 ) -> str:
     if col is None:
         return ""
-    return str(merged_value(sheet, merges, row, col) or "").strip()
+    val = merged_value(sheet, merges, row, col)
+    if (val is None or (isinstance(val, str) and val.startswith("="))) and formula_sheet:
+        raw = merged_value(formula_sheet, merges, row, col)
+        if isinstance(raw, str) and raw.startswith("="):
+            val = _eval_formula(raw, sheet, merges, circuit_col or 3)
+        elif raw is not None:
+            val = raw
+    elif isinstance(val, str) and val.startswith("="):
+        val = _eval_formula(val, sheet, merges, circuit_col or 3)
+    return str(val or "").strip()
+
+
+NEW_CIRCUIT_FORMULA = re.compile(
+    r'=LEFT\(([A-Z]+)(\d+),LEN\(\1\2\)-2\)\s*&\s*"3"\s*&\s*RIGHT\(\1\2,1\)',
+    re.I,
+)
+
+
+def _col_letters_to_num(letters: str) -> int:
+    n = 0
+    for ch in letters.upper():
+        n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n
+
+
+def _eval_formula(formula: str, sheet: Worksheet, merges: MergeIndex, circuit_col: int) -> str:
+    m = NEW_CIRCUIT_FORMULA.match(formula.strip())
+    if m:
+        ref_col = _col_letters_to_num(m.group(1))
+        ref_row = int(m.group(2))
+        base = str(merged_value(sheet, merges, ref_row, ref_col) or "")
+        if len(base) >= 2:
+            return base[:-2] + "3" + base[-1]
+    return formula
 
 
 def row_has_site_ports(
-    sheet: Worksheet,
+    values_sheet: Worksheet,
+    styles_sheet: Worksheet,
     merges: MergeIndex,
     row: int,
     sites: list[tuple[int, str]],
 ) -> bool:
     for col, _ in sites:
-        port, _ = port_at_row(sheet, merges, row, col)
+        port, _ = port_at_row(values_sheet, styles_sheet, merges, row, col)
         if port:
             return True
     return False
 
 
 def block_end(
-    sheet: Worksheet,
+    values_sheet: Worksheet,
+    styles_sheet: Worksheet,
     merges: MergeIndex,
     start: int,
     circuit_col: int | None,
@@ -359,18 +472,18 @@ def block_end(
 ) -> int:
     end = start
     if circuit_col:
-        for row in range(start + 1, sheet.max_row + 1):
+        for row in range(start + 1, values_sheet.max_row + 1):
             tl = merges.top_left(row, circuit_col)
             if tl and tl[0] == start:
                 end = row
             else:
                 break
     if sites:
-        for row in range(end + 1, sheet.max_row + 1):
-            circ = str(sheet.cell(row, circuit_col).value or "").strip() if circuit_col else ""
+        for row in range(end + 1, values_sheet.max_row + 1):
+            circ = str(values_sheet.cell(row, circuit_col).value or "").strip() if circuit_col else ""
             if circ:
                 break
-            if row_has_site_ports(sheet, merges, row, sites):
+            if row_has_site_ports(values_sheet, styles_sheet, merges, row, sites):
                 end = row
             else:
                 break
@@ -394,50 +507,80 @@ def is_circuit_start(
 
 
 def connections_in_block(
-    sheet: Worksheet,
+    values_sheet: Worksheet,
+    styles_sheet: Worksheet,
     merges: MergeIndex,
     start: int,
     end: int,
     sites: list[tuple[int, str]],
 ) -> list[Connection]:
     result: list[Connection] = []
+    pending: SitePort | None = None
 
     for row in range(start, end + 1):
         ports: list[SitePort] = []
         for col, site_name in sites:
-            port, color = port_at_row(sheet, merges, row, col)
+            port, color = port_at_row(values_sheet, styles_sheet, merges, row, col)
             if port:
                 ports.append(SitePort(site_name, port, color))
 
         if len(ports) >= 2:
+            if pending:
+                result.append(Connection([pending]))
+                pending = None
             for i in range(0, len(ports) - 1, 2):
                 if i + 1 < len(ports):
                     result.append(Connection([ports[i], ports[i + 1]]))
         elif len(ports) == 1:
-            result.append(Connection([ports[0]]))
+            if pending:
+                result.append(Connection([pending, ports[0]]))
+                pending = None
+            else:
+                pending = ports[0]
+        elif pending:
+            result.append(Connection([pending]))
+            pending = None
+
+    if pending:
+        result.append(Connection([pending]))
 
     return result
 
 
-def parse_circuits(sheet: Worksheet) -> tuple[list[Circuit], SheetLayout]:
-    layout = detect_layout(sheet)
-    merges = MergeIndex(sheet)
+def parse_circuits(
+    values_sheet: Worksheet,
+    styles_sheet: Worksheet,
+    formula_sheet: Worksheet | None = None,
+) -> tuple[list[Circuit], SheetLayout]:
+    layout = detect_layout(values_sheet)
+    merges = MergeIndex(values_sheet)
+    formula_sheet = formula_sheet or values_sheet
     circuits: list[Circuit] = []
     row = layout.first_data_row
 
-    while row <= sheet.max_row:
-        if not is_circuit_start(sheet, merges, row, layout):
+    while row <= values_sheet.max_row:
+        if not is_circuit_start(values_sheet, merges, row, layout):
             row += 1
             continue
 
-        end = block_end(sheet, merges, row, layout.circuit, layout.sites)
-        conns = connections_in_block(sheet, merges, row, end, layout.sites)
+        end = block_end(
+            values_sheet, styles_sheet, merges, row, layout.circuit, layout.sites
+        )
+        conns = connections_in_block(
+            values_sheet, styles_sheet, merges, row, end, layout.sites
+        )
 
         circuits.append(
             Circuit(
-                number=read_field(sheet, merges, row, layout.circuit),
-                new_number=read_field(sheet, merges, row, layout.new_circuit),
-                name=read_field(sheet, merges, row, layout.name),
+                number=read_field(
+                    values_sheet, merges, row, layout.circuit, formula_sheet, layout.circuit
+                ),
+                new_number=read_field(
+                    values_sheet, merges, row, layout.new_circuit, formula_sheet, layout.circuit
+                ),
+                name=read_field(
+                    values_sheet, merges, row, layout.name, formula_sheet, layout.circuit
+                ),
                 connections=conns,
             )
         )
@@ -483,17 +626,25 @@ def render(circuits: list[Circuit]) -> str:
 # Diagnose
 # ---------------------------------------------------------------------------
 
-def diagnose(sheet: Worksheet) -> None:
-    print(f"Sheet : {sheet.title!r}")
-    print(f"Size  : {sheet.max_row} rows x {sheet.max_column} cols")
+def load_sheets(path: Path) -> tuple[Worksheet, Worksheet, Worksheet]:
+    wb_values = openpyxl.load_workbook(path, data_only=True)
+    wb_styles = openpyxl.load_workbook(path, data_only=False)
+    values = pick_sheet(wb_values)
+    styles = pick_sheet(wb_styles)
+    return values, styles, styles
+
+
+def diagnose(values: Worksheet, styles: Worksheet) -> None:
+    print(f"Sheet : {values.title!r}")
+    print(f"Size  : {values.max_row} rows x {values.max_column} cols")
 
     try:
-        layout = detect_layout(sheet)
+        layout = detect_layout(values)
     except ValueError as exc:
         print(f"\nLayout error: {exc}")
         print("\nFirst 5 rows (non-empty cells):")
-        for r in range(1, min(6, sheet.max_row + 1)):
-            cells = [(c.column, repr(c.value)) for c in sheet[r] if c.value is not None]
+        for r in range(1, min(6, values.max_row + 1)):
+            cells = [(c.column, repr(c.value)) for c in values[r] if c.value is not None]
             if cells:
                 print(f"  row {r}: {cells[:20]}{'...' if len(cells) > 20 else ''}")
         return
@@ -513,7 +664,7 @@ def diagnose(sheet: Worksheet) -> None:
     if len(layout.sites) > 10:
         print(f"    ... and {len(layout.sites) - 10} more")
 
-    circuits, _ = parse_circuits(sheet)
+    circuits, _ = parse_circuits(values, styles, styles)
     print(f"\nCircuits found   : {len(circuits)}")
     if circuits:
         c = circuits[0]
@@ -549,14 +700,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: file not found: {path}", file=sys.stderr)
         return 1
 
-    wb = openpyxl.load_workbook(path, data_only=False)
-    sheet = pick_sheet(wb)
+    values, styles, formulas = load_sheets(path)
 
     if args.diagnose:
-        diagnose(sheet)
+        diagnose(values, styles)
         return 0
 
-    circuits, layout = parse_circuits(sheet)
+    circuits, layout = parse_circuits(values, styles, formulas)
     text = render(circuits)
 
     out_path = Path(args.output) if args.output else path.with_name(path.stem + "_output.txt")
